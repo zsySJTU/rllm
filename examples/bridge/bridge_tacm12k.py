@@ -2,145 +2,134 @@
 # ArXiv: https://arxiv.org/abs/2407.20157
 
 # Datasets  TACM12K
-# Acc       0.324
+# Acc       0.293
 
 import time
 import argparse
-import os.path as osp
-import pandas as pd
 import sys
-
-sys.path.append("../")
-sys.path.append("../../")
+import os.path as osp
 
 import torch
 import torch.nn.functional as F
 
-import rllm.transforms.graph_transforms as T
+sys.path.append("./")
+sys.path.append("../")
 from rllm.datasets import TACM12KDataset
-from rllm.nn.models import Bridge
-from rllm.transforms.graph_transforms import build_homo_graph
+from rllm.transforms.graph_transforms import GCNTransform
+from rllm.transforms.table_transforms import TabTransformerTransform
+from rllm.nn.conv.graph_conv import GCNConv
+from rllm.nn.conv.table_conv import TabTransformerConv
+from rllm.nn.models import Bridge, TableEncoder, GraphEncoder
+from utils import build_homo_graph
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--tab_dim", type=int, default=256, help="Tab Transformer categorical embedding dim"
-)
-parser.add_argument("--gcn_dropout", type=float, default=0.5, help="Dropout for GCN")
 parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
 parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
 parser.add_argument("--wd", type=float, default=5e-4, help="Weight decay")
 args = parser.parse_args()
 
-# Prepare datasets
+# Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load dataset
 path = osp.join(osp.dirname(osp.realpath(__file__)), "../..", "data")
 dataset = TACM12KDataset(cached_dir=path, force_reload=True)
+
+# Get the required data
 (
-    paper_table,
-    author_table,
-    cite_table,
-    writing_table,
+    papers_table,
+    authors_table,
+    citations_table,
+    _,
     paper_embeddings,
-    author_embeddings,
+    _,
 ) = dataset.data_list
+emb_size = paper_embeddings.size(1)
+target_table = papers_table.to(device)
+y = papers_table.y.long().to(device)
+paper_embeddings = paper_embeddings.to(device)
 
-cite = cite_table.df.assign(Target=cite_table.df["paper_id_cited"])
-author2id = {
-    author_id: idx + paper_embeddings.size(0)
-    for idx, author_id in enumerate(author_table.df.index.to_numpy())
-}
-writed = writing_table.df.assign(Target=writing_table.df["author_id"].map(author2id))
-
-# Get relation with cite_table and writing_table
-relation_df = pd.concat(
-    [cite.iloc[:, [0, 2]], writed.iloc[:, [0, 2]]], axis=0, ignore_index=True
-)
-x = torch.cat([paper_embeddings, author_embeddings], dim=0)
-
-# Making graph
-emb_size = x.size(1)
+# Build graph
 graph = build_homo_graph(
-    df=relation_df,
-    n_src=len(paper_table),
-    n_tgt=len(author_table),
-    x=x,
-    y=paper_table.y.long(),
-    transform=T.GCNNorm(),
+    relation_df=citations_table.df,
+    n_all=len(papers_table),
+).to(device)
+
+# Transform data
+table_transform = TabTransformerTransform(
+    out_dim=emb_size, metadata=target_table.metadata
 )
-graph.paper_table = paper_table
-graph.author_table = author_table
-graph = graph.to(device)
+target_table = table_transform(data=target_table)
+graph_transform = GCNTransform()
+adj = graph_transform(data=graph).adj
+
+# Split data
 train_mask, val_mask, test_mask = (
-    graph.paper_table.train_mask,
-    graph.paper_table.val_mask,
-    graph.paper_table.test_mask,
+    target_table.train_mask,
+    target_table.val_mask,
+    target_table.test_mask,
 )
-output_dim = graph.paper_table.num_classes
+
+# Set up model and optimizer
+t_encoder = TableEncoder(
+    in_dim=emb_size,
+    out_dim=emb_size,
+    table_conv=TabTransformerConv,
+    metadata=target_table.metadata,
+)
+g_encoder = GraphEncoder(
+    in_dim=emb_size,
+    out_dim=target_table.num_classes,
+    graph_conv=GCNConv,
+)
+model = Bridge(
+    table_encoder=t_encoder,
+    graph_encoder=g_encoder,
+).to(device)
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=args.lr,
+    weight_decay=args.wd,
+)
 
 
-def accuracy_score(preds, truth):
-    return (preds == truth).sum(dim=0) / len(truth)
-
-
-def train_epoch() -> float:
+def train() -> float:
     model.train()
     optimizer.zero_grad()
     logits = model(
-        graph.paper_table,
-        graph.x,
-        graph.adj,
-        len(paper_table),
-        len(paper_table) + len(author_table),
+        table=target_table,
+        non_table=paper_embeddings[len(target_table) :, :],
+        adj=adj,
     )
-    loss = F.cross_entropy(logits[train_mask].squeeze(), graph.y[train_mask])
+    loss = F.cross_entropy(logits[train_mask].squeeze(), y[train_mask])
     loss.backward()
     optimizer.step()
     return loss.item()
 
 
 @torch.no_grad()
-def test_epoch():
+def test():
     model.eval()
     logits = model(
-        graph.paper_table,
-        graph.x,
-        graph.adj,
-        len(paper_table),
-        len(paper_table) + len(author_table),
+        table=target_table,
+        non_table=paper_embeddings[len(target_table) :, :],
+        adj=adj,
     )
     preds = logits.argmax(dim=1)
-    y = graph.y
-    train_acc = accuracy_score(preds[train_mask], y[train_mask])
-    val_acc = accuracy_score(preds[val_mask], y[val_mask])
-    test_acc = accuracy_score(preds[test_mask], y[test_mask])
-    return train_acc.item(), val_acc.item(), test_acc.item()
 
+    accs = []
+    for mask in [train_mask, val_mask, test_mask]:
+        correct = float(preds[mask].eq(y[mask]).sum().item())
+        accs.append(correct / int(mask.sum()))
+    return accs
 
-model = Bridge(
-    table_hidden_dim=emb_size,
-    graph_output_dim=output_dim,
-    stats_dict=graph.paper_table.stats_dict,
-    graph_dropout=args.gcn_dropout,
-    graph_layers=2,
-    graph_hidden_dim=128,
-).to(device)
 
 start_time = time.time()
 best_val_acc = best_test_acc = 0
-optimizer = torch.optim.Adam(
-    [
-        dict(params=model.table_encoder.parameters(), lr=0.001),
-        dict(params=model.graph_encoder.parameters(), lr=0.01, weight_decay=1e-4),
-    ]
-    # model.parameters(),
-    # lr=args.lr,
-    # weight_decay=args.wd
-)
-
 for epoch in range(1, args.epochs + 1):
-    train_loss = train_epoch()
-    train_acc, val_acc, test_acc = test_epoch()
+    train_loss = train()
+    train_acc, val_acc, test_acc = test()
     print(
         f"Epoch: [{epoch}/{args.epochs}]"
         f"Loss: {train_loss:.4f} train_acc: {train_acc:.4f} "

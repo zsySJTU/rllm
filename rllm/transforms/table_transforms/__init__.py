@@ -1,14 +1,13 @@
-from .coltype_transform import ColTypeTransform
-from .tabletype_transform import TableTypeTransform
+from .col_transform import ColTransform
+from .stack_numerical import StackNumerical
+from .table_transform import TableTransform
 from .tab_transformer_transform import TabTransformerTransform
-from .ft_transformer_transform import FTTransformerTransform
-from .tabnet_transform import TabNetTransform
-
+from .default_table_transform import DefaultTableTransform
 
 __all__ = [
-    'ColTypeTransform',
-    'TableTypeTransform',
-    'TabTransformerTransform',
-    'FTTransformerTransform',
-    'TabNetTransform',
+    "ColTransform",
+    "StackNumerical",
+    "TableTransform",
+    "TabTransformerTransform",
+    "DefaultTableTransform",
 ]

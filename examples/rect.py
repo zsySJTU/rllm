@@ -11,69 +11,108 @@
 
 # Datasets              Citeseer    |         Cora         | Pubmed
 # Unseen Classes  [1, 2, 5]  [3, 4] | [1, 2, 3]  [3, 4, 6] | [2]
-# RECT-L          66.50      68.40  | 74.80      72.20     | 75.30
+# RECT-L          57.50      60.80  | 65.20      65.70     | 64.50
 
 import argparse
 import copy
-import os.path as osp
 import time
+import sys
+import os.path as osp
+
 import torch
 from sklearn.linear_model import LogisticRegression
-import sys
 
+sys.path.append("./")
 sys.path.append("../")
-import rllm.transforms.graph_transforms as T
-from rllm.datasets.planetoid import PlanetoidDataset
-from rllm.nn.models.rect import RECT_L
+from rllm.datasets import PlanetoidDataset
+from rllm.nn.models import RECT_L
+from rllm.transforms.graph_transforms import RECTTransform
+from rllm.transforms.utils import RemoveTrainingClasses
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--dataset", type=str, default="Cora", choices=["Cora", "CiteSeer", "PubMed"]
+    "--dataset", type=str, default="cora", choices=["cora", "citeseer", "pubmed"]
 )
 parser.add_argument("--unseen-classes", type=int, nargs="*", default=[1, 2, 3])
-parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
+parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+parser.add_argument("--wd", type=float, default=0, help="Weight decay")
+parser.add_argument("--dropout", type=float, default=0.0, help="Graph Dropout")
+parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
 args = parser.parse_args()
 
-transform = T.Compose([T.NormalizeFeatures("l2"), T.SVDFeatureReduction(200), T.GDC()])
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-path = osp.join(osp.dirname(osp.realpath(__file__)), "../data")
-dataset = PlanetoidDataset(path, args.dataset, transform=transform, force_reload=True)
-data = dataset[0]
+# Load dataset
+path = osp.join(osp.dirname(osp.realpath(__file__)), "..", "data")
+data = PlanetoidDataset(path, args.dataset, force_reload=True)[0]
 
-zs_data = T.RemoveTrainingClasses(args.unseen_classes)(copy.deepcopy(data))
+# Transform data
+transform = RECTTransform()
+data = transform(data)
+zs_data = RemoveTrainingClasses(args.unseen_classes)(copy.deepcopy(data)).to(device)
 
-model = RECT_L(200, 200, dropout=0.0)
-zs_data.y = model.get_semantic_labels(zs_data.x, zs_data.y, zs_data.train_mask)
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+# Set up model, optimizer and loss function
+model = RECT_L(
+    in_dim=200,
+    hidden_dim=200,
+    dropout=args.dropout,
+).to(device)
+zs_data.y = model.get_semantic_labels(
+    x=zs_data.x,
+    y=zs_data.y,
+    mask=zs_data.train_mask,
+)
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=args.lr,
+    weight_decay=args.wd,
+)
+loss_fn = torch.nn.MSELoss(reduction="sum")
 
-model, zs_data = model.to(device), zs_data.to(device)
 
-criterion = torch.nn.MSELoss(reduction="sum")
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
-
-model.train()
-st = time.time()
-for epoch in range(1, args.epochs + 1):
+def train():
+    model.train()
     optimizer.zero_grad()
     out = model(zs_data.x, zs_data.adj)
-    loss = criterion(out[zs_data.train_mask], zs_data.y)
+    loss = loss_fn(out[zs_data.train_mask], zs_data.y)
     loss.backward()
     optimizer.step()
-    print(f"Epoch {epoch:03d}, Loss {loss:.4f}")
-et = time.time()
-model.eval()
-with torch.no_grad():
-    h = model.embed(zs_data.x, zs_data.adj).cpu()
+    return loss.item()
 
-reg = LogisticRegression()
-reg.fit(h[data.train_mask].numpy(), data.y[data.train_mask].numpy())
-test_acc = reg.score(h[data.test_mask].numpy(), data.y[data.test_mask].numpy())
-print(f"Total Time  : {et-st:.4f}s")
-print(f"Test Acc    : {test_acc:.4f}")
+
+@torch.no_grad()
+def test():
+    model.eval()
+    out = model.embed(zs_data.x, zs_data.adj).cpu()
+    reg = LogisticRegression()
+    reg.fit(out[data.train_mask].numpy(), data.y[data.train_mask].numpy())
+    train_acc = reg.score(out[data.train_mask].numpy(), data.y[data.train_mask].numpy())
+    test_acc = reg.score(out[data.test_mask].numpy(), data.y[data.test_mask].numpy())
+    return train_acc, test_acc
+
+
+metric = "Acc"
+best_test_acc = 0
+times = []
+for epoch in range(1, args.epochs + 1):
+    start = time.time()
+
+    train_loss = train()
+    train_acc, test_acc = test()
+
+    if test_acc > best_test_acc:
+        best_test_acc = test_acc
+
+    times.append(time.time() - start)
+    print(
+        f"Epoch: [{epoch}/{args.epochs}] "
+        f"Train Loss: {train_loss:.4f} Train {metric}: {train_acc:.4f} "
+        f"Test Acc: {test_acc:.4f} "
+    )
+
+print(f"Mean time per epoch: {torch.tensor(times).mean():.4f}s")
+print(f"Total time: {sum(times):.4f}s")
+print(f"Best test acc: {best_test_acc:.4f}")

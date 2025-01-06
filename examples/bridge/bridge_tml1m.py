@@ -2,115 +2,140 @@
 # ArXiv: https://arxiv.org/abs/2407.20157
 
 # Datasets  TML1M
-# Acc       0.428
+# Acc       0.397
 
 import time
 import argparse
-import os.path as osp
 import sys
-
-sys.path.append("../")
-sys.path.append("../../")
+import os.path as osp
 
 import torch
 import torch.nn.functional as F
 
-import rllm.transforms.graph_transforms as T
+sys.path.append("./")
+sys.path.append("../")
 from rllm.datasets import TML1MDataset
-from rllm.nn.models import Bridge
-from rllm.transforms.graph_transforms import build_homo_graph
+from rllm.transforms.graph_transforms import GCNTransform
+from rllm.transforms.table_transforms import TabTransformerTransform
+from rllm.nn.conv.graph_conv import GCNConv
+from rllm.nn.conv.table_conv import TabTransformerConv
+from rllm.nn.models import Bridge, TableEncoder, GraphEncoder
+from utils import build_homo_graph, reorder_ids
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--tab_dim", type=int, default=64, help="Tab Transformer categorical embedding dim"
-)
-parser.add_argument("--gcn_dropout", type=float, default=0.5, help="Dropout for GCN")
-parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
+parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
 parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
 parser.add_argument("--wd", type=float, default=1e-4, help="Weight decay")
 args = parser.parse_args()
 
-# Prepare datasets
+# Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load data
 path = osp.join(osp.dirname(osp.realpath(__file__)), "../..", "data")
 dataset = TML1MDataset(cached_dir=path, force_reload=True)
-user_table, movie_table, rating_table, movie_embeddings = dataset.data_list
 
-# We assume it a homogeneous graph,
-# so we need to reorder the user and movie id.
-ordered_rating = rating_table.df.assign(
-    UserID=rating_table.df["UserID"] - 1,
-    MovieID=rating_table.df["MovieID"] + len(user_table) - 1,
-)
-
-# Making graph
+# Get the required data
+(
+    user_table,
+    _,
+    rating_table,
+    movie_embeddings,
+) = dataset.data_list
 emb_size = movie_embeddings.size(1)
-len_user = len(user_table)
-len_movie = len(movie_table)
-# User embeddings will be further trained
-user_embeddings = torch.randn(len_user, emb_size)
-x = torch.cat([user_embeddings, movie_embeddings], dim=0)
+user_size = len(user_table)
+
+ordered_rating = reorder_ids(
+    relation_df=rating_table.df,
+    src_col_name="UserID",
+    tgt_col_name="MovieID",
+    n_src=user_size,
+)
+target_table = user_table.to(device)
+y = user_table.y.long().to(device)
+movie_embeddings = movie_embeddings.to(device)
+
+# Build graph
 graph = build_homo_graph(
-    df=ordered_rating,
-    n_src=len_user,
-    n_tgt=len_movie,
-    x=x,
-    y=user_table.y.long(),
-    transform=T.GCNNorm(),
+    relation_df=ordered_rating,
+    n_all=user_size + movie_embeddings.size(0),
+).to(device)
+
+# Transform data
+table_transform = TabTransformerTransform(
+    out_dim=emb_size, metadata=target_table.metadata
 )
-graph.user_table = user_table
-graph.movie_table = movie_table
-graph = graph.to(device)
+target_table = table_transform(target_table)
+graph_transform = GCNTransform()
+adj = graph_transform(graph).adj
+
+# Split data
 train_mask, val_mask, test_mask = (
-    graph.user_table.train_mask,
-    graph.user_table.val_mask,
-    graph.user_table.test_mask,
+    user_table.train_mask,
+    user_table.val_mask,
+    user_table.test_mask,
 )
-output_dim = graph.user_table.num_classes
+
+# Set up model and optimizer
+t_encoder = TableEncoder(
+    in_dim=emb_size,
+    out_dim=emb_size,
+    table_conv=TabTransformerConv,
+    metadata=target_table.metadata,
+)
+g_encoder = GraphEncoder(
+    in_dim=emb_size,
+    out_dim=target_table.num_classes,
+    graph_conv=GCNConv,
+)
+model = Bridge(
+    table_encoder=t_encoder,
+    graph_encoder=g_encoder,
+).to(device)
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=args.lr,
+    weight_decay=args.wd,
+)
 
 
-def accuracy_score(preds, truth):
-    return (preds == truth).sum(dim=0) / len(truth)
-
-
-def train_epoch() -> float:
+def train() -> float:
     model.train()
     optimizer.zero_grad()
-    logits = model(graph.user_table, graph.x, graph.adj, len_user, len_user + len_movie)
-    loss = F.cross_entropy(logits[train_mask].squeeze(), graph.y[train_mask])
+    logits = model(
+        table=user_table,
+        non_table=movie_embeddings,
+        adj=adj,
+    )
+    loss = F.cross_entropy(logits[train_mask].squeeze(), y[train_mask])
     loss.backward()
     optimizer.step()
     return loss.item()
 
 
 @torch.no_grad()
-def test_epoch():
+def test():
     model.eval()
-    logits = model(graph.user_table, graph.x, graph.adj, len_user, len_user + len_movie)
+    logits = model(
+        table=user_table,
+        non_table=movie_embeddings,
+        adj=adj,
+    )
     preds = logits.argmax(dim=1)
-    y = graph.y
-    train_acc = accuracy_score(preds[train_mask], y[train_mask])
-    val_acc = accuracy_score(preds[val_mask], y[val_mask])
-    test_acc = accuracy_score(preds[test_mask], y[test_mask])
-    return train_acc.item(), val_acc.item(), test_acc.item()
 
-
-model = Bridge(
-    table_hidden_dim=emb_size,
-    graph_layers=2,
-    graph_output_dim=output_dim,
-    stats_dict=graph.user_table.stats_dict,
-    graph_dropout=args.gcn_dropout,
-).to(device)
+    accs = []
+    for mask in [train_mask, val_mask, test_mask]:
+        correct = float(preds[mask].eq(y[mask]).sum().item())
+        accs.append(correct / int(mask.sum()))
+    return accs
 
 
 start_time = time.time()
 best_val_acc = best_test_acc = 0
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
 for epoch in range(1, args.epochs + 1):
-    train_loss = train_epoch()
-    train_acc, val_acc, test_acc = test_epoch()
+    train_loss = train()
+    train_acc, val_acc, test_acc = test()
     print(
         f"Epoch: [{epoch}/{args.epochs}]"
         f"Loss: {train_loss:.4f} train_acc: {train_acc:.4f} "

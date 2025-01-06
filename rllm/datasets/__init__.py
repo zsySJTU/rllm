@@ -1,3 +1,5 @@
+from .adult import Adult
+from .churn_modelling import ChurnModelling
 from .dblp import DBLP
 from .imdb import IMDB
 from .planetoid import PlanetoidDataset
@@ -9,13 +11,15 @@ from .titanic import Titanic
 from .tagdataset import TAGDataset
 
 __all__ = [
-    'DBLP',
-    'IMDB',
-    'PlanetoidDataset',
-    'TML1MDataset',
-    'TAPEDataset',
-    'Titanic',
-    'TAGDataset',
-    'TLF2KDataset',
-    'TACM12KDataset',
+    "Adult",
+    "ChurnModelling",
+    "DBLP",
+    "IMDB",
+    "PlanetoidDataset",
+    "TML1MDataset",
+    "TAPEDataset",
+    "Titanic",
+    "TAGDataset",
+    "TLF2KDataset",
+    "TACM12KDataset",
 ]

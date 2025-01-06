@@ -14,10 +14,12 @@ from .tabnet import (
     # GLU_Block,
     # GLU_Layer
 )
-from .bridge import Bridge
+from .bridge import Bridge, TableEncoder, GraphEncoder
 
 __all__ = [
-    'RECT_L',
-    'TabNet',
-    'Bridge',
+    "RECT_L",
+    "TabNet",
+    "Bridge",
+    "TableEncoder",
+    "GraphEncoder",
 ]

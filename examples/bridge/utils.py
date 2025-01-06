@@ -1,4 +1,5 @@
-from typing import Optional, Callable
+from typing import Optional
+
 import pandas as pd
 import torch
 from torch import Tensor
@@ -6,42 +7,57 @@ from torch import Tensor
 from rllm.data import GraphData
 
 
-def build_homo_graph(
-    df: pd.DataFrame,
+def reorder_ids(
+    relation_df: pd.DataFrame,
+    src_col_name: str,
+    tgt_col_name: str,
     n_src: int,
-    n_tgt: int,
-    x: Tensor,
+):
+    r"""Reorders the IDs in the relationship DataFrame by adjusting the
+    original source IDs and target column IDs.
+
+    Args:
+        relation_df (pd.DataFrame): DataFrame containing the relationships.
+        src_col_name (str): Name of the source column in the DataFrame.
+        tgt_col_name (str): Name of the target column in the DataFrame.
+        n_src (int): Number of source nodes.
+    """
+    # Making relationship
+    ordered_rating = relation_df.assign(
+        **{
+            src_col_name: relation_df[src_col_name] - 1,
+            tgt_col_name: relation_df[tgt_col_name] + n_src - 1,
+        }
+    )
+
+    return ordered_rating
+
+
+def build_homo_graph(
+    relation_df: pd.DataFrame,
+    n_all: int,
+    x: Optional[Tensor] = None,
     y: Optional[Tensor] = None,
-    transform: Optional[Callable] = None,
     edge_per_node: Optional[int] = None,
 ):
     r"""Use the given dataframe to construct a simple undirected and
         unweighted graph with only two types of nodes and one type of edge.
 
     Args:
-        df (pd.DataFrame): The given dataframe, where the first two columns
-            represent two types of nodes that may be connected in a
+        relation_df (pd.DataFrame): The given dataframe, where the first two
+            columns represent two types of nodes that may be connected in a
             homogeneous graph (abbreviated as sorce nodes and target nodes).
             Assume that the indices of source and target nodes
             in the dataframe start from 0.
-        src_nodes (int): Total amount of source nodes.
-        tgt_nodes (int): Total amount of target nodes.
+        n_all (int): Total amount of nodes.
         x (Tensor): Features of nodes.
         y (Optional[Tensor]): Labels of (part) nodes.
-        names (List[str]):
-            The names of the two types of nodes in the generated graph.
-        transform (Optional[Callable]):
-            A function/transform that takes in a :obj:`GraphData`
-            and returns a transformed version.
         edge_per_node (Optional[int]):
-            specifying the maximum numberof edges to keep for each node.
+            specifying the maximum number of edges to keep for each node.
     """
 
-    n_all = n_src + n_tgt
-    assert n_all == x.size(0)
-
     # Get adj
-    src_nodes, tgt_nodes = torch.from_numpy(df.iloc[:, :2].values).t()
+    src_nodes, tgt_nodes = torch.from_numpy(relation_df.iloc[:, :2].values).t()
     indices = torch.cat(
         [
             torch.stack([src_nodes, tgt_nodes], dim=0),  # src -> tgt
@@ -69,14 +85,11 @@ def build_homo_graph(
                 mask[node_edges] = True
 
         indices = indices[:, mask]
-    
+
     values = torch.ones((indices.shape[1],), dtype=torch.float32)
     adj = torch.sparse_coo_tensor(indices, values, (n_all, n_all))
 
     # Construct graph
     graph = GraphData(x=x, y=y, adj=adj)
-    # Use transform
-    if transform:
-        graph = transform(graph)
 
     return graph

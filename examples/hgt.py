@@ -5,57 +5,79 @@
 # Datasets  IMDB
 # Acc       0.583
 
+import argparse
+import sys
+import time
+from typing import Dict, List, Union
 import os.path as osp
-from typing import List
+
 import torch
 import torch.nn.functional as F
-from torch import nn
-import sys
 
+sys.path.append("./")
 sys.path.append("../")
-from rllm.data import HeteroGraphData
-from rllm.datasets.imdb import IMDB
+from rllm.datasets import IMDB
 from rllm.nn.conv.graph_conv import HGTConv
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--lr", type=float, default=5e-3, help="Learning rate")
+parser.add_argument("--wd", type=float, default=1e-3, help="Weight decay")
+parser.add_argument("--dropout", type=float, default=0.6, help="Graph Dropout")
+parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
+parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
+args = parser.parse_args()
 
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load dataset
 path = osp.join(osp.dirname(osp.realpath(__file__)), "..", "data")
-dataset = IMDB(path)
-data = dataset[0]
+data = IMDB(path)[0]
+data.to(device)
 
 
-class HGT(nn.Module):
+# Define model
+class HGT(torch.nn.Module):
     def __init__(
-        self, hidden_channels: int, out_channels: int, data: HeteroGraphData, heads=8
+        self,
+        in_dim: Union[int, Dict[str, int]],
+        out_dim: int,
+        hidden_dim: int = 128,
+        num_heads: int = 8,
+        dropout: int = 0.6,
+        metadata: Dict[str, List[str]] = None,
     ):
         super().__init__()
-        self.lin_dict = nn.ModuleDict()
-        for node_type in data.node_types:
-            self.lin_dict[node_type] = nn.Linear(
-                in_features=data.x_dict()[node_type].shape[1],
-                out_features=hidden_channels,
-            )
         self.hgt_conv = HGTConv(
-            hidden_channels,
-            hidden_channels,
-            heads=heads,
-            dropout_rate=0.6,
-            metadata=data.metadata(),
+            in_dim=in_dim,
+            out_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            metadata=metadata,
+            use_pre_encoder=True,
         )
-        self.lin = nn.Linear(hidden_channels, out_channels)
+        self.lin = torch.nn.Linear(hidden_dim, out_dim)
 
     def forward(self, x_dict, adj_dict):
-        out = {}
-        for node_type, x in x_dict.items():
-            out[node_type] = self.lin_dict[node_type](x)
-        out = self.hgt_conv(out, adj_dict)
+        out = self.hgt_conv(x_dict, adj_dict)
         out = self.lin(out["movie"])
         return out
 
 
-model = HGT(data=data, hidden_channels=128, out_channels=3)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-data, model = data.to(device), model.to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=0.001)
+# Set up model and optimizer
+in_dim = {node_type: data[node_type].x.shape[1] for node_type in data.node_types}
+out_dim = torch.unique(data["movie"].y).numel()
+model = HGT(
+    in_dim=in_dim,
+    out_dim=out_dim,
+    dropout=args.dropout,
+    metadata=data.metadata(),
+).to(device)
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=args.lr,
+    weight_decay=args.wd,
+)
 
 
 def train() -> float:
@@ -76,31 +98,35 @@ def test() -> List[float]:
 
     accs = []
     for split in ["train_mask", "val_mask", "test_mask"]:
-        # mask = data[split]
         mask = getattr(data, split)
         acc = (pred[mask] == data["movie"].y[mask]).sum() / mask.sum()
         accs.append(float(acc))
     return accs
 
 
-best_val_acc = 0
-best_test_acc = 0
-start_patience = patience = 100
-for epoch in range(1, 200):
+metric = "Acc"
+best_val_acc = best_test_acc = 0
+times = []
+start_patience = patience = args.patience
+for epoch in range(1, args.epochs + 1):
+    start = time.time()
 
-    loss = train()
+    train_loss = train()
     train_acc, val_acc, test_acc = test()
-    print(
-        f"Epoch: {epoch:03d}, Loss: {loss:.4f}, Train: {train_acc:.4f}, "
-        f"Val: {val_acc:.4f}, Test: {test_acc:.4f}"
-    )
 
-    if best_val_acc <= val_acc:
-        patience = start_patience
+    if val_acc > best_val_acc:
         best_val_acc = val_acc
         best_test_acc = test_acc
+        patience = start_patience
     else:
         patience -= 1
+
+    times.append(time.time() - start)
+    print(
+        f"Epoch: [{epoch}/{args.epochs}] "
+        f"Train Loss: {train_loss:.4f} Train {metric}: {train_acc:.4f} "
+        f"Val {metric}: {val_acc:.4f}, Test {metric}: {test_acc:.4f} "
+    )
 
     if patience <= 0:
         print(
@@ -109,5 +135,6 @@ for epoch in range(1, 200):
         )
         break
 
-
+print(f"Mean time per epoch: {torch.tensor(times).mean():.4f}s")
+print(f"Total time: {sum(times):.4f}s")
 print(f"Best test acc: {best_test_acc:.4f}")

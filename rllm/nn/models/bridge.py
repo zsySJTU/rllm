@@ -1,91 +1,148 @@
-from typing import Any, List, Dict, Optional
+from typing import Any, Dict, List, Type
 
 import torch
+from torch import Tensor
 import torch.nn.functional as F
 
 from rllm.types import ColType
-from rllm.transforms.table_transforms import FTTransformerTransform
+from rllm.data import TableData
 from rllm.nn.conv.table_conv import TabTransformerConv
 from rllm.nn.conv.graph_conv import GCNConv
 
 
-class Bridge(torch.nn.Module):
-    r"""Bridge method introduced in the
-    `rLLM: Relational Table Learning with LLMs
-    <https://arxiv.org/abs/2407.20157>`__ paper.
-    Here is a simple example, any suitable TNN and GNN can be used.
+class TableEncoder(torch.nn.Module):
+    r"""TableEncoder is a submodule of the BRIDGE method,
+    which mainly performs multi-layer convolution of the incoming table.
+    The TableEncoder takes as input :class:`rllm.data.TableData` representing
+    the tabular data and applies multiple convolutional layers to capture
+    complex patterns and relationships within the data. Before outputting,
+    the feature dictionary is concatenated to facilitate subsequent operations.
 
     Args:
-        table_hidden_dim (int): Hidden dimensionality for catrgorical features.
-        table_output_dim (int): Output dimensionality for table encoder,
-            as well as the input dimensionality of graph encoder.
-        table_layers (int): Number of TNN layers.
-        table_heads (int): Number of heads in the self-attention layer.
-        graph_dropout (int): Dropout for graph encoder.
-        graph_hidden_dim (int): Hidden dimensionality for GCN.
-        graph_output_dim (int):  Output dimensionality for graph encoder.
-        graph_layers (int): GCN layers.
-        stats_dict (Dict[:class:`rllm.types.ColType`, List[dict[str, Any]]):
-            A dictionary that maps column type into stats. The column
-            with same :class:`rllm.types.ColType` will be put together."""
+        in_dim (int): Input dimensionality of the table data.
+        out_dim (int): Output dimensionality for the encoded table data.
+        num_layers (int, optional):
+            Number of convolution layers (default: :obj:`1`).
+        metadata (Dict[ColType, List[Dict[str, Any]]], optional):
+            Metadata for each column type, specifying the statistics and
+            properties of the columns. (default: :obj:`None`).
+        table_conv (Type[torch.nn.Module], optional):
+            The convolution module to be used for encoding the table data
+            (default: :obj:`rllm.nn.conv.table_conv.TabTransformerConv`).
+    """
 
     def __init__(
         self,
-        table_hidden_dim: int,
-        stats_dict: Dict[ColType, List[Dict[str, Any]]],
-        graph_output_dim: int,
-        graph_hidden_dim: Optional[int] = None,
-        table_layers: int = 2,
-        graph_layers: int = 1,
-        graph_dropout: int = 0.5,
-    ):
-        if graph_hidden_dim is None:
-            self.graph_hidden_dim = table_hidden_dim
-        else:
-            self.graph_hidden_dim = graph_hidden_dim
+        in_dim: int,
+        out_dim: int,
+        num_layers: int = 1,
+        metadata: Dict[ColType, List[Dict[str, Any]]] = None,
+        table_conv: Type[torch.nn.Module] = TabTransformerConv,
+    ) -> None:
+
         super().__init__()
-        self.dropout = graph_dropout
-        self.table_transform = FTTransformerTransform(
-            out_dim=table_hidden_dim,
-            col_stats_dict=stats_dict,
-        )
-        self.table_encoder = torch.nn.ModuleList([
-            TabTransformerConv(
-                dim=table_hidden_dim,
-            ) for _ in range(table_layers)
-        ])
-        # self.table_encoder = TabTransformer(
-        #     hidden_dim=table_hidden_dim,  # embedding dimension
-        #     output_dim=table_output_dim,  # multi-class prediction
-        #     layers=table_layers,  # depth
-        #     heads=table_heads,  # heads
-        #     col_stats_dict=stats_dict,
-        # )
 
-        layers = []
-        if graph_layers >= 2:
-            layers.append(GCNConv(table_hidden_dim, self.graph_hidden_dim))
-            for _ in range(graph_layers - 2):
-                layers.append(GCNConv(self.graph_hidden_dim, self.graph_hidden_dim))
-            layers.append(GCNConv(self.graph_hidden_dim, graph_output_dim))
-        else:
-            layers.append(GCNConv(table_hidden_dim, graph_output_dim))
-        self.graph_encoder = torch.nn.ModuleList(layers)
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(table_conv(dim=out_dim, metadata=metadata))
+        for _ in range(num_layers - 1):
+            self.convs.append(table_conv(dim=out_dim))
 
-    def forward(self, table, x, adj, valid, total):
-        feat_dict = table.get_feat_dict()  # A dict contains feature tensor.
-        x_valid, _ = self.table_transform(feat_dict)
-        for layer in self.table_encoder:
-            x_valid = layer(x_valid)
+    def forward(self, table: TableData) -> Tensor:
+        x = table.feat_dict
+        for conv in self.convs:
+            x = conv(x)
+        x = torch.cat(list(x.values()), dim=1)
+        x = x.mean(dim=1)
+        return x
 
-        x_valid = x_valid.mean(dim=1)
-        x = torch.cat([x_valid, x[valid:total, :]], dim=0)
 
-        for layer in self.graph_encoder[:-1]:
+class GraphEncoder(torch.nn.Module):
+    r"""GraphEncoder is a submodule of the BRIDGE method,
+    which mainly performs multi-layer convolution of the incoming graph.
+    This submodule is designed to handle graph-structured data. And it takes
+    as input two tensor representing the node feature and graph structure.
+    Each convolutional layer is followed by activation functions and optional
+    normalization layers to enhance the representation learning capability.
+
+    Args:
+        in_dim (int): Input dimensionality of the data.
+        out_dim (int): Output dimensionality for the encoded data.
+        dropout (float): Dropout probability.
+        num_layers (int): The number of layers of the convolution.
+        graph_conv (Type[torch.nn.Module], optional):
+            The convolution module to be used for encoding the graph data
+            (default: :obj:`rllm.nn.conv.graph_conv.GCNConv`).
+    """
+
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        dropout: float = 0.5,
+        num_layers: int = 2,
+        graph_conv: Type[torch.nn.Module] = GCNConv,
+    ) -> None:
+        super().__init__()
+        self.dropout = dropout
+        self.convs = torch.nn.ModuleList()
+
+        for _ in range(num_layers - 1):
+            self.convs.append(graph_conv(in_dim=in_dim, out_dim=in_dim))
+        self.convs.append(graph_conv(in_dim=in_dim, out_dim=out_dim))
+
+    def forward(self, x: Tensor, adj: Tensor) -> Tensor:
+        for conv in self.convs[:-1]:
             x = F.dropout(x, p=self.dropout, training=self.training)
-            x = layer(x, adj)
-            x = F.relu(x)
-        # Last layer without relu
+            x = F.relu(conv(x, adj))
         x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.graph_encoder[-1](x, adj)
-        return x[:valid, :]  # Only return valid sample embedding.
+        x = self.convs[-1](x, adj)
+        return x
+
+
+class Bridge(torch.nn.Module):
+    r"""The Bridge model introduced in the `"rLLM: Relational Table Learning
+    with LLMs" <https://arxiv.org/abs/2407.20157>`__ paper.
+    Bridge is a simple RTL method based on rLLM framework, which
+    combines table neural networks (TNNs) and graph neural networks (GNNs) to
+    deal with multi-table data and their interrelationships, and uses "foreign
+    keys" to build relationships and analyze them to improve the performance of
+    multi-table joint learning tasks.
+
+    Args:
+        table_encoder (TableEncoder): Encoder for tabular data.
+        graph_encoder (GraphEncoder): Encoder for graph data.
+    """
+
+    def __init__(
+        self,
+        table_encoder: TableEncoder,
+        graph_encoder: GraphEncoder,
+    ) -> None:
+        super().__init__()
+        self.table_encoder = table_encoder
+        self.graph_encoder = graph_encoder
+
+    def forward(
+        self,
+        table: Tensor,
+        non_table: Tensor,
+        adj: Tensor,
+    ) -> Tensor:
+        """
+        First, the Table Neural Network (TNN) learns the tabular data.
+        Second, the learned representations are concatenated with the non-tabular data.
+        Third, the Graph Neural Network (GNN) processes the combined data.
+        along with the adjacency matrix to learn the overall representation.
+
+        Args:
+            table (Tensor): Input tabular data.
+            non_table (Tensor): Input non-tabular data.
+            adj (Tensor): Adjacency matrix.
+
+        Returns:
+            Tensor: Output node features.
+        """
+        t_embedds = self.table_encoder(table)
+        node_feats = torch.cat([t_embedds, non_table], dim=0)
+        node_feats = self.graph_encoder(node_feats, adj)
+        return node_feats[: len(table), :]

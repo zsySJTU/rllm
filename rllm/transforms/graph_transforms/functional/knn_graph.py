@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Dict, Optional
 
 import sklearn
 import sklearn.neighbors
@@ -9,18 +9,18 @@ from rllm.utils.sparse import sparse_mx_to_torch_sparse_tensor
 
 def knn_graph(
     x: Tensor,
-    k: Optional[int] = 6,
-    mode: Optional[str] = 'connectivity',
-    metric: Optional[str] = 'minkowski',
+    num_neighbors: Optional[int] = 6,
+    mode: Optional[str] = "connectivity",
+    metric: Optional[str] = "minkowski",
     p: Optional[int] = 2,
-    metric_params: Optional[dict] = None,
+    metric_params: Optional[Dict] = None,
     include_self: Optional[bool] = False,
-    n_jobs: int = 1
+    n_jobs: int = 1,
 ):
     r"""Creates a k-NN graph based on node features
     Args:
         x (Tensor): The node features.
-        k (int, optional): The number of neighbors. (default: 6)
+        num_neighbors (int, optional): Number of neighbors. (default: 6)
         mode (str[`connectivity`, `distance`], optional):
             Type of returned matrix:
             `connectivity` will return the connectivity matrix
@@ -32,6 +32,7 @@ def knn_graph(
             Default is `minkowski`, which results in the standard
             Euclidean distance when p = 2.
             (default: `minkowski`)
+        p (float): Power parameter for the Minkowski metric (default: `2`).
         metric_paramsdict (dict, optinal):
             Additional keyword arguments
             for the metric function.
@@ -42,14 +43,14 @@ def knn_graph(
     """
 
     adj = sklearn.neighbors.kneighbors_graph(
-            X=x,
-            n_neighbors=k,
-            mode=mode,
-            metric=metric,
-            p=p,
-            metric_params=metric_params,
-            include_self=include_self,
-            n_jobs=n_jobs
-        )
+        X=x,
+        n_neighbors=num_neighbors,
+        mode=mode,
+        metric=metric,
+        p=p,
+        metric_params=metric_params,
+        include_self=include_self,
+        n_jobs=n_jobs,
+    )
     adj_sp = sparse_mx_to_torch_sparse_tensor(adj)
     return adj_sp

@@ -32,7 +32,7 @@ class TLF2KDataset(Dataset):
 
     .. parsed-literal::
 
-        Table 1: artists
+        Table1: artists
         ---------------
             Statics:
             Name        Users     Features
@@ -50,17 +50,18 @@ class TLF2KDataset(Dataset):
             Name        Ratings     Features
             nodes       12,717      2
     """
+
     url = "https://raw.githubusercontent.com/rllm-project/rllm_datasets/main/sjtutables/TLF2K.zip"  # noqa
 
-    def __init__(
-        self,
-        cached_dir: str,
-        force_reload: Optional[bool] = False
-    ) -> None:
-        self.name = 'Table-LastFM2K'
+    def __init__(self, cached_dir: str, force_reload: Optional[bool] = False) -> None:
+        self.name = "Table-LastFM2K"
         root = os.path.join(cached_dir, self.name)
         super().__init__(root, force_reload=force_reload)
 
+        # Table-LastFM2K data_list:
+        # 0: artists_table
+        # 1: user_artists_table
+        # 2: user_friends_ table
         self.data_list: List[TableData] = [
             TableData.load(self.processed_paths[0]),
             TableData.load(self.processed_paths[1]),
@@ -69,20 +70,11 @@ class TLF2KDataset(Dataset):
 
     @property
     def raw_filenames(self):
-        return [
-            'artists.csv',
-            'user_artists.csv',
-            'user_friends.csv',
-            'masks.pt'
-        ]
+        return ["artists.csv", "user_artists.csv", "user_friends.csv", "masks.pt"]
 
     @property
     def processed_filenames(self):
-        return [
-            'artists_data.pt',
-            'user_artists_data.pt',
-            'user_friends_data.pt'
-        ]
+        return ["artists_data.pt", "user_artists_data.pt", "user_friends_data.pt"]
 
     def process(self):
         r"""
@@ -104,7 +96,7 @@ class TLF2KDataset(Dataset):
         }
         # Create masks
         masks_path = osp.join(self.raw_dir, self.raw_filenames[3])
-        masks = torch.load(masks_path)
+        masks = torch.load(masks_path, weights_only=False)
         TableData(
             df=artist_df,
             col_types=col_types,
@@ -134,7 +126,7 @@ class TLF2KDataset(Dataset):
 
     def download(self):
         os.makedirs(self.raw_dir, exist_ok=True)
-        path = download_url(self.url, self.raw_dir, 'TLF2K.zip')
+        path = download_url(self.url, self.raw_dir, "TLF2K.zip")
         extract_zip(path, self.raw_dir)
         os.remove(path)
 

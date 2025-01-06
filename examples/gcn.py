@@ -9,41 +9,49 @@
 import argparse
 import os.path as osp
 import time
+import sys
 
 import torch
 import torch.nn.functional as F
 
-import sys
-
+sys.path.append("./")
 sys.path.append("../")
-import rllm.transforms.graph_transforms as T
-from rllm.datasets.planetoid import PlanetoidDataset
+from rllm.datasets import PlanetoidDataset
+from rllm.transforms.graph_transforms import GCNTransform
 from rllm.nn.conv.graph_conv import GCNConv
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "--dataset", type=str, default="cora", choices=["citeseer", "cora", "pubmed"]
 )
-parser.add_argument("--hidden_channels", type=int, default=16, help="Hidden channel")
+parser.add_argument("--hidden_dim", type=int, default=16, help="Hidden channel")
 parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
 parser.add_argument("--wd", type=float, default=5e-4, help="Weight decay")
 parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
 parser.add_argument("--dropout", type=float, default=0.5, help="Graph Dropout")
+parser.add_argument("--seed", type=int, default=42)
 args = parser.parse_args()
 
-transform = T.Compose([T.NormalizeFeatures("l2"), T.GCNNorm()])
+# Set random seed and device
+torch.manual_seed(args.seed)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Load dataset
 path = osp.join(osp.dirname(osp.realpath(__file__)), "..", "data")
-dataset = PlanetoidDataset(path, args.dataset, transform=transform)
-data = dataset[0]
+data = PlanetoidDataset(path, args.dataset)[0]
+
+# Transform data
+transform = GCNTransform()
+data = transform(data).to(device)
 
 
+# Define model
 class GCN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, dropout):
+    def __init__(self, in_dim, hidden_dim, out_dim, dropout):
         super().__init__()
         self.dropout = dropout
-        self.conv1 = GCNConv(in_channels, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, out_channels)
+        self.conv1 = GCNConv(in_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, out_dim)
 
     def forward(self, x, adj):
         x = F.dropout(x, p=self.dropout, training=self.training)
@@ -53,16 +61,18 @@ class GCN(torch.nn.Module):
         return x
 
 
+# Set up model, optimizer and loss function
 model = GCN(
-    in_channels=data.x.shape[1],
-    hidden_channels=args.hidden_channels,
-    out_channels=data.num_classes,
+    in_dim=data.x.shape[1],
+    hidden_dim=args.hidden_dim,
+    out_dim=data.num_classes,
     dropout=args.dropout,
-)
-
+).to(device)
 optimizer = torch.optim.Adam(
-    model.parameters(), lr=args.lr, weight_decay=args.wd
-)  # Only perform weight-decay on first convolution.
+    model.parameters(),
+    lr=args.lr,
+    weight_decay=args.wd,
+)
 loss_fn = torch.nn.CrossEntropyLoss()
 
 
@@ -89,18 +99,26 @@ def test():
     return accs
 
 
+metric = "Acc"
 best_val_acc = best_test_acc = 0
 times = []
-st = time.time()
 for epoch in range(1, args.epochs + 1):
     start = time.time()
+
     train_loss = train()
     train_acc, val_acc, test_acc = test()
+
     if val_acc > best_val_acc:
         best_val_acc = val_acc
         best_test_acc = test_acc
+
     times.append(time.time() - start)
-et = time.time()
+    print(
+        f"Epoch: [{epoch}/{args.epochs}] "
+        f"Train Loss: {train_loss:.4f} Train {metric}: {train_acc:.4f} "
+        f"Val {metric}: {val_acc:.4f}, Test {metric}: {test_acc:.4f} "
+    )
+
 print(f"Mean time per epoch: {torch.tensor(times).mean():.4f}s")
-print(f"Total time: {et-st}s")
+print(f"Total time: {sum(times):.4f}s")
 print(f"Best test acc: {best_test_acc:.4f}")

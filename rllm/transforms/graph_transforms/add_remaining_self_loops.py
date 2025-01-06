@@ -1,11 +1,13 @@
-from typing import Any, Union
+from typing import Union
 
-from rllm.transforms.utils import add_remaining_self_loops
+from torch import Tensor
+
 from rllm.data.graph_data import GraphData, HeteroGraphData
-from rllm.transforms.graph_transforms import BaseTransform
+from rllm.transforms.graph_transforms import NETransform
+from rllm.transforms.graph_transforms.functional import add_remaining_self_loops
 
 
-class AddRemainingSelfLoops(BaseTransform):
+class AddRemainingSelfLoops(NETransform):
     r"""Add self-loops into the adjacency matrix.
 
     .. math::
@@ -13,18 +15,27 @@ class AddRemainingSelfLoops(BaseTransform):
 
     Args:
         fill_value (Any): values to be filled in the self-loops,
-            the default values is 1.
+            the default values is 1.0
     """
-    def __init__(self, fill_value: Any = 1.):
-        self.fill_value = fill_value
 
-    def forward(self, data: Any):
+    def __init__(self, fill_value=1.0):
+        self.fill_value = fill_value
+        self.data = None
+
+    def forward(self, data):
+        if self.data is not None:
+            return self.data
+
         if isinstance(data, Union[GraphData, HeteroGraphData]):
             assert data.adj is not None
-            data.adj = add_remaining_self_loops(data.adj)
+            data.adj = add_remaining_self_loops(data.adj, self.fill_value)
         elif isinstance(data, HeteroGraphData):
             for store in data.edge_stores:
-                if 'adj' not in store or not store.is_bipartite():
+                if "adj" not in store or not store.is_bipartite():
                     continue
-                store.adj = add_remaining_self_loops(store.adj)
+                store.adj = add_remaining_self_loops(store.adj, self.fill_value)
+        elif isinstance(data, Tensor):
+            assert data.size(0) == data.size(1)
+            data = add_remaining_self_loops(data, self.fill_value)
+        self.data = data
         return data

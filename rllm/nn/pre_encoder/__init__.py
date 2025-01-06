@@ -1,11 +1,8 @@
-from .coltype_encoders import (
-    EmbeddingEncoder,
-    LinearEncoder,
-    StackEncoder,
-)
+from .tab_transformer_pre_encoder import TabTransformerPreEncoder
+from .ft_transformer_pre_encoder import FTTransformerPreEncoder
 
 __all__ = [
-    'EmbeddingEncoder',
-    'LinearEncoder',
-    'StackEncoder',
+    # TNN Model Encoder
+    "TabTransformerPreEncoder",
+    "FTTransformerPreEncoder",
 ]

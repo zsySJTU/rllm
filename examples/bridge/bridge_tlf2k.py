@@ -2,118 +2,137 @@
 # ArXiv: https://arxiv.org/abs/2407.20157
 
 # Datasets  TLF2K
-# Acc       0.494
+# Acc       0.471
 
 import time
 import argparse
-import os.path as osp
 import sys
-
-sys.path.append("../")
-sys.path.append("../../")
+import os.path as osp
 
 import torch
 import torch.nn.functional as F
 
-import rllm.transforms.graph_transforms as T
+sys.path.append("./")
+sys.path.append("../")
 from rllm.datasets import TLF2KDataset
-from rllm.nn.models import Bridge
-from rllm.transforms.graph_transforms import build_homo_graph
+from rllm.transforms.graph_transforms import GCNTransform
+from rllm.transforms.table_transforms import TabTransformerTransform
+from rllm.nn.conv.graph_conv import GCNConv
+from rllm.nn.conv.table_conv import TabTransformerConv
+from rllm.nn.models import Bridge, TableEncoder, GraphEncoder
+from utils import build_homo_graph, reorder_ids
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--tab_dim", type=int, default=64, help="Tab Transformer categorical embedding dim"
-)
-parser.add_argument("--gcn_dropout", type=float, default=0.5, help="Dropout for GCN")
-parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
+parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
 parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
 parser.add_argument("--wd", type=float, default=1e-4, help="Weight decay")
 args = parser.parse_args()
 
-# Prepare datasets
+# Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load data
 path = osp.join(osp.dirname(osp.realpath(__file__)), "../..", "data")
-
 dataset = TLF2KDataset(cached_dir=path, force_reload=True)
-artist_table, ua_table, uu_table = dataset.data_list
 
-# We assume it a homogeneous graph,
-# so we need to reorder the user and artist id.
-ordered_ua = ua_table.df.assign(
-    artistID=ua_table.df["artistID"] - 1,
-    userID=ua_table.df["userID"] + len(artist_table) - 1,
+# Get the required data
+artist_table, ua_table, _ = dataset.data_list
+emb_size = 384  # Dataset lacks embeddings, so manually set emb_size to 384 for consistency with other examples.
+
+artist_size = len(artist_table)
+user_size = ua_table.df["userID"].max()
+target_table = artist_table.to(device)
+y = artist_table.y.long().to(device)
+user_embeddings = torch.randn((user_size, emb_size)).to(device)
+
+ordered_ua = reorder_ids(
+    relation_df=ua_table.df,
+    src_col_name="artistID",
+    tgt_col_name="userID",
+    n_src=artist_size,
 )
 
-# Making graph
-emb_size = 384  # Since user doesn't have an embedding, randomly select a dim.
-len_artist = len(artist_table)
-len_user = ua_table.df["userID"].max()
-# Randomly initialize the embedding, artist embedding will be further trained
-x = torch.randn(len_artist + len_user, emb_size)
+# Build graph
 graph = build_homo_graph(
-    df=ordered_ua,
-    n_src=len_artist,
-    n_tgt=len_user,
-    x=x,
-    y=artist_table.y.long(),
-    transform=T.GCNNorm(),
+    relation_df=ordered_ua,
+    n_all=artist_size + user_size,
+).to(device)
+
+# Transform data
+table_transform = TabTransformerTransform(
+    out_dim=emb_size, metadata=target_table.metadata
 )
-graph.artist_table = artist_table
-graph = graph.to(device)
+target_table = table_transform(target_table)
+graph_transform = GCNTransform()
+adj = graph_transform(graph).adj
+
+# Split data
 train_mask, val_mask, test_mask = (
-    graph.artist_table.train_mask,
-    graph.artist_table.val_mask,
-    graph.artist_table.test_mask,
+    artist_table.train_mask,
+    artist_table.val_mask,
+    artist_table.test_mask,
 )
-output_dim = graph.artist_table.num_classes
+
+# Set up model and optimizer
+t_encoder = TableEncoder(
+    in_dim=emb_size,
+    out_dim=emb_size,
+    table_conv=TabTransformerConv,
+    metadata=target_table.metadata,
+)
+g_encoder = GraphEncoder(
+    in_dim=emb_size,
+    out_dim=target_table.num_classes,
+    graph_conv=GCNConv,
+)
+model = Bridge(
+    table_encoder=t_encoder,
+    graph_encoder=g_encoder,
+).to(device)
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=args.lr,
+    weight_decay=args.wd,
+)
 
 
-def accuracy_score(preds, truth):
-    return (preds == truth).sum(dim=0) / len(truth)
-
-
-def train_epoch() -> float:
+def train() -> float:
     model.train()
     optimizer.zero_grad()
     logits = model(
-        graph.artist_table, graph.x, graph.adj, len_artist, len_artist + len_user
+        table=target_table,
+        non_table=user_embeddings,
+        adj=adj,
     )
-    loss = F.cross_entropy(logits[train_mask].squeeze(), graph.y[train_mask])
+    loss = F.cross_entropy(logits[train_mask].squeeze(), y[train_mask])
     loss.backward()
     optimizer.step()
     return loss.item()
 
 
 @torch.no_grad()
-def test_epoch():
+def test():
     model.eval()
     logits = model(
-        graph.artist_table, graph.x, graph.adj, len_artist, len_artist + len_user
+        table=target_table,
+        non_table=user_embeddings,
+        adj=adj,
     )
     preds = logits.argmax(dim=1)
-    y = graph.y
-    train_acc = accuracy_score(preds[train_mask], y[train_mask])
-    val_acc = accuracy_score(preds[val_mask], y[val_mask])
-    test_acc = accuracy_score(preds[test_mask], y[test_mask])
-    return train_acc.item(), val_acc.item(), test_acc.item()
 
-
-model = Bridge(
-    table_hidden_dim=emb_size,
-    graph_layers=2,
-    graph_output_dim=output_dim,
-    stats_dict=graph.artist_table.stats_dict,
-    graph_dropout=args.gcn_dropout,
-).to(device)
+    accs = []
+    for mask in [train_mask, val_mask, test_mask]:
+        correct = float(preds[mask].eq(y[mask]).sum().item())
+        accs.append(correct / int(mask.sum()))
+    return accs
 
 
 start_time = time.time()
 best_val_acc = best_test_acc = 0
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
 for epoch in range(1, args.epochs + 1):
-    train_loss = train_epoch()
-    train_acc, val_acc, test_acc = test_epoch()
+    train_loss = train()
+    train_acc, val_acc, test_acc = test()
     print(
         f"Epoch: [{epoch}/{args.epochs}]"
         f"Loss: {train_loss:.4f} train_acc: {train_acc:.4f} "

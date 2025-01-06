@@ -1,89 +1,94 @@
+# The Trompt method from the
+# "Trompt: Towards a Better Deep Neural Network for Tabular Data" paper.
+# ArXiv: https://arxiv.org/abs/1609.02907
+
+# Datasets  Titanic    Adult
+# Acc       0.820      0.854
+# Time      9.8s      276.1s
+
 import argparse
-import os.path as osp
 import sys
+import time
+from typing import Any, Dict, List
+import os.path as osp
 
-sys.path.append("../")
-
+from tqdm import tqdm
 import torch
 from torch import Tensor
-import torch.nn.functional as F
-from torch.nn import LayerNorm, Linear, ReLU, Sequential
-from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+import torch.nn.functional as F
 
+sys.path.append("./")
+sys.path.append("../")
 from rllm.types import ColType
-from rllm.datasets.titanic import Titanic
-from rllm.transforms.table_transforms import FTTransformerTransform
+from rllm.datasets import Titanic
+from rllm.transforms.table_transforms import DefaultTableTransform
 from rllm.nn.conv.table_conv import FTTransformerConv
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--dataset",
-    type=str,
-    default="titanic",
-    choices=[
-        "titanic",
-    ],
-)
-parser.add_argument("--dim", help="embedding dim.", type=int, default=32)
+parser.add_argument("--emb_dim", help="embedding dim", type=int, default=32)
 parser.add_argument("--num_layers", type=int, default=3)
-parser.add_argument("--batch_size", type=int, default=128)
-parser.add_argument("--lr", type=float, default=0.001)
-parser.add_argument("--epochs", type=int, default=50)
-parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--wd", type=float, default=5e-4)
+parser.add_argument("--batch_size", type=int, default=256)
+parser.add_argument("--epochs", type=int, default=100)
+parser.add_argument("--lr", type=float, default=1e-4)
+parser.add_argument("--wd", type=float, default=1e-5)
+parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
 
+# Set random seed and device
 torch.manual_seed(args.seed)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Prepare datasets
+# Load dataset
 path = osp.join(osp.dirname(osp.realpath(__file__)), "..", "data")
-dataset = Titanic(cached_dir=path)[0]
-dataset.to(device)
+data = Titanic(cached_dir=path)[0]
+
+# Transform data
+transform = DefaultTableTransform(out_dim=args.emb_dim)
+data = transform(data).to(device)
+data.shuffle()
 
 # Split dataset, here the ratio of train-val-test is 80%-10%-10%
-train_loader, val_loader, test_loader = dataset.get_dataloader(
-    0.8, 0.1, 0.1, batch_size=args.batch_size
+train_loader, val_loader, test_loader = data.get_dataloader(
+    train_split=0.8, val_split=0.1, test_split=0.1, batch_size=args.batch_size
 )
 
 
-# Set up model and optimizer
+# Define model
 class FTTransformer(torch.nn.Module):
     def __init__(
         self,
         hidden_dim: int,
-        output_dim: int,
-        layers: int,
-        col_stats_dict: dict[ColType, list[dict[str,]]],
+        out_dim: int,
+        num_layers: int,
+        metadata: Dict[ColType, List[Dict[str, Any]]],
     ):
         super().__init__()
-        self.transform = FTTransformerTransform(
-            out_dim=hidden_dim,
-            col_stats_dict=col_stats_dict,
-        )
-        self.convs = FTTransformerConv(dim=hidden_dim, layers=layers)
-        self.fc = self.decoder = Sequential(
-            LayerNorm(hidden_dim),
-            ReLU(),
-            Linear(hidden_dim, output_dim),
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(FTTransformerConv(dim=hidden_dim, metadata=metadata))
+        for _ in range(num_layers - 1):
+            self.convs.append(FTTransformerConv(dim=hidden_dim))
+
+        self.fc = torch.nn.Sequential(
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, out_dim),
         )
 
     def forward(self, x) -> Tensor:
-        x, _ = self.transform(x)
-        x, x_cls = self.convs(x)
-        out = self.fc(x_cls)
+        for conv in self.convs:
+            x = conv(x)
+        out = self.fc(x[:, 0, :])
         return out
 
 
+# Set up model and optimizer
 model = FTTransformer(
-    hidden_dim=args.dim,
-    output_dim=dataset.num_classes,
-    layers=args.num_layers,
-    col_stats_dict=dataset.stats_dict,
+    hidden_dim=args.emb_dim,
+    out_dim=data.num_classes,
+    num_layers=args.num_layers,
+    metadata=data.metadata,
 ).to(device)
-
 optimizer = torch.optim.Adam(
     model.parameters(),
     lr=args.lr,
@@ -109,25 +114,23 @@ def train(epoch: int) -> float:
 @torch.no_grad()
 def test(loader: DataLoader) -> float:
     model.eval()
-    all_preds = []
-    all_labels = []
+    correct = total = 0
     for batch in loader:
-        x, y = batch
-        pred = model.forward(x)
-        all_labels.append(y.cpu())
-        all_preds.append(pred[:, 1].detach().cpu())
-    all_labels = torch.cat(all_labels).numpy()
-    all_preds = torch.cat(all_preds).numpy()
-
-    # Compute the overall AUC
-    overall_auc = roc_auc_score(all_labels, all_preds)
-    return overall_auc
+        feat_dict, y = batch
+        pred = model.forward(feat_dict)
+        _, predicted = torch.max(pred, 1)
+        total += y.size(0)
+        correct += (predicted == y).sum().item()
+    accuracy = correct / total
+    return accuracy
 
 
-metric = "AUC"
-best_val_metric = 0
-best_test_metric = 0
+metric = "Acc"
+best_val_metric = best_test_metric = 0
+times = []
 for epoch in range(1, args.epochs + 1):
+    start = time.time()
+
     train_loss = train(epoch)
     train_metric = test(train_loader)
     val_metric = test(val_loader)
@@ -137,12 +140,15 @@ for epoch in range(1, args.epochs + 1):
         best_val_metric = val_metric
         best_test_metric = test_metric
 
+    times.append(time.time() - start)
     print(
+        f"Epoch: [{epoch}/{args.epochs}]"
         f"Train Loss: {train_loss:.4f}, Train {metric}: {train_metric:.4f}, "
         f"Val {metric}: {val_metric:.4f}, Test {metric}: {test_metric:.4f}"
     )
-    optimizer.step()
 
+print(f"Mean time per epoch: {torch.tensor(times).mean():.4f}s")
+print(f"Total time: {sum(times):.4f}s")
 print(
     f"Best Val {metric}: {best_val_metric:.4f}, "
     f"Best Test {metric}: {best_test_metric:.4f}"

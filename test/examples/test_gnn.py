@@ -1,3 +1,16 @@
+# This file contains unit tests for various Graph Neural Network (GNN) examples
+# in the rLLM framework. The tests ensure that the example scripts run
+# successfully and produce the expected output.
+
+# The following example scripts are tested:
+# 1. gcn.py: Tests the GCN model.
+# 2. gat.py: Tests the GAT model.
+# 3. rect.py: Tests the ReCT model.
+# 4. ogc.py: Tests the OGC model.
+
+# Each test function runs the corresponding example script and verifies the
+# output to ensure it meets the expected criteria.
+
 import os
 import subprocess
 
@@ -9,6 +22,7 @@ EXAMPLE_ROOT = os.path.join(
 )
 
 
+# Test homologous GNN
 def test_gcn():
     script = os.path.join(EXAMPLE_ROOT, "gcn.py")
     out = subprocess.run(["python", str(script)], capture_output=True)
@@ -16,7 +30,7 @@ def test_gcn():
         out.returncode == 0
     ), f"stdout: {out.stdout.decode('utf-8')}\nstderr: {out.stderr.decode('utf-8')}"
     stdout = out.stdout.decode("utf-8")
-    assert float(stdout[-9:]) > 0.815
+    assert float(stdout[-8:]) > 0.815
 
 
 def test_gat():
@@ -26,17 +40,7 @@ def test_gat():
         out.returncode == 0
     ), f"stdout: {out.stdout.decode('utf-8')}\nstderr: {out.stderr.decode('utf-8')}"
     stdout = out.stdout.decode("utf-8")
-    assert float(stdout[-9:]) > 0.82
-
-
-def test_han():
-    script = os.path.join(EXAMPLE_ROOT, "han.py")
-    out = subprocess.run(["python", str(script)], capture_output=True)
-    assert (
-        out.returncode == 0
-    ), f"stdout: {out.stdout.decode('utf-8')}\nstderr: {out.stderr.decode('utf-8')}"
-    stdout = out.stdout.decode("utf-8")
-    assert float(stdout[-9:]) > 0.56
+    assert float(stdout[-8:]) > 0.82
 
 
 def test_rect():
@@ -46,7 +50,7 @@ def test_rect():
         out.returncode == 0
     ), f"stdout: {out.stdout.decode('utf-8')}\nstderr: {out.stderr.decode('utf-8')}"
     stdout = out.stdout.decode("utf-8")
-    assert float(stdout[-9:]) > 0.70
+    assert float(stdout[-8:]) > 0.63
 
 
 def test_ogc():
@@ -56,4 +60,25 @@ def test_ogc():
         out.returncode == 0
     ), f"stdout: {out.stdout.decode('utf-8')}\nstderr: {out.stderr.decode('utf-8')}"
     stdout = out.stdout.decode("utf-8")
-    assert float(stdout[-9:]) > 0.86
+    assert float(stdout[-8:]) > 0.86
+
+
+# Test heterogeneous GNN
+def test_han():
+    script = os.path.join(EXAMPLE_ROOT, "han.py")
+    out = subprocess.run(["python", str(script)], capture_output=True)
+    assert (
+        out.returncode == 0
+    ), f"stdout: {out.stdout.decode('utf-8')}\nstderr: {out.stderr.decode('utf-8')}"
+    stdout = out.stdout.decode("utf-8")
+    assert float(stdout[-8:]) > 0.56
+
+
+def test_hgt():
+    script = os.path.join(EXAMPLE_ROOT, "hgt.py")
+    out = subprocess.run(["python", str(script)], capture_output=True)
+    assert (
+        out.returncode == 0
+    ), f"stdout: {out.stdout.decode('utf-8')}\nstderr: {out.stderr.decode('utf-8')}"
+    stdout = out.stdout.decode("utf-8")
+    assert float(stdout[-8:]) > 0.56

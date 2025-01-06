@@ -1,5 +1,6 @@
 __pycache__/
 .pytest_cache/
+.vscode/
 .DS_Store
 data/
 build/
@@ -25,6 +26,7 @@ coverage.xml
 *.zip
 *.pt
 *.onnx
+*.exe
 examples/**/*.png
 examples/**/*.pdf
 benchmark/results/
